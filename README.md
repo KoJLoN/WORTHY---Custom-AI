@@ -46,3 +46,21 @@ Notes on W
 The W model is capable of writing anything effectively in spreadhseet form. After which, simply copy paste the text into a document and it will flow perfectly.
 The Ai was able to produce enough subsequent text to fill 270 pages in under 1 hour. In the current version, the writing is quite good, and aware of itself and other writing in the project (cohesive).
 Keep in mind, it will generally auto-select the writing type. You cant manually trigger the writing type yet. (Novel, short story, etc.) Only auto detect is currently live (Backwards I know).
+
+## Component map (W/O/R/T/H/Y)
+
+- **W (Writer):** Autonomous writing engine that infers writing type, builds outline + section prompts, and writes full prose into workbook sheets continuously until all planned sections are complete.
+- **O (Operations):** Control-sheet automation engine that reads a `Control` sheet and runs business spreadsheet tasks (`NEW_POOL`, `SUMMARIZE_POOL`, `DECISION_MATRIX`).
+- **R (Research):** Multi-series research planner/evaluator engine with rubric grading and GPA-style scoring; intended to iterate toward a target quality threshold.
+- **T (Task Router):** Workbook task dispatcher for `dataanalysis*`, `survey*`, and `visualization*` sheet families, writing outputs into paired `*A` sheets.
+- **H (Life Planner):** Psychometric/life-planning engine that builds questions, profile, answer history, and plan sheets.
+- **Y (YOU-Mode):** Persona cloning engine that extracts style traits from writing samples and generates predicted responses for prompt sets.
+
+### Current practical status in this version
+
+- **W:** configured and marked working in project notes.
+- **R:** configured and marked working in project notes.
+- **O:** engine code exists, but top-level runner currently does not pass required workbook CLI arg; treat as **not yet wired** from selector flow.
+- **T:** engine code exists and can run without CLI args; selector wiring exists.
+- **H:** engine code exists, but top-level runner currently does not pass required workbook CLI arg; treat as **not yet wired** from selector flow.
+- **Y:** engine code exists and selector wiring exists.
