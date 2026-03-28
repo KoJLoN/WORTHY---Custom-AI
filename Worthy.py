@@ -434,32 +434,226 @@ if __name__ == "__main__":
 # ===== Engine O source =====
 #===ENGINE_O_START===
 O_CODE = r'''import argparse
+import re
 from pathlib import Path
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
 
 CONTROL_SHEET = "Control"
+MAX_TABS = 20
 
 def ensure_sheet(wb, name):
     if name in wb.sheetnames:
         return wb[name]
     return wb.create_sheet(title=name)
 
+def get_column_a_priority_tasks(ws):
+    """
+    Read A1 downward until first blank.
+    Remove duplicates while preserving order (A3 beats A4 overlap).
+    """
+    ordered = []
+    seen = set()
+    row = 1
+    while True:
+        value = ws.cell(row=row, column=1).value
+        if value is None or str(value).strip() == "":
+            break
+        raw = str(value).strip()
+        norm = raw.lower()
+        if norm not in seen:
+            ordered.append(raw)
+            seen.add(norm)
+        row += 1
+    return ordered
+
+def list_tabs_progress(wb):
+    tabs = wb.sheetnames[:MAX_TABS]
+    print("Tab list:")
+    for name in tabs:
+        print(f"- {name}")
+    print("end of list")
+    return tabs
+
+def _has_text_or_value(v):
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return v.strip() != ""
+    return True
+
+def detect_ostensible_borders(ws):
+    """
+    Border heuristic:
+    - Find first row with any text in first 5 active columns
+    - Track last populated row, then allow +3 row cushion after blank streak
+    - Find last populated column and start writable border after 3 empty columns
+    """
+    max_row_scan = max(ws.max_row, 1) + 30
+    max_col_scan = max(ws.max_column, 1) + 10
+
+    left_text_col = None
+    for c in range(1, max_col_scan + 1):
+        for r in range(1, min(max_row_scan, 60) + 1):
+            if _has_text_or_value(ws.cell(row=r, column=c).value):
+                left_text_col = c
+                break
+        if left_text_col is not None:
+            break
+    if left_text_col is None:
+        return (1, 1, 1, 6)
+
+    probe_cols = list(range(left_text_col, left_text_col + 5))
+
+    top_row = None
+    for r in range(1, max_row_scan + 1):
+        if any(_has_text_or_value(ws.cell(row=r, column=c).value) for c in probe_cols):
+            top_row = r
+            break
+    if top_row is None:
+        top_row = 1
+
+    last_text_row = top_row
+    blank_streak = 0
+    for r in range(top_row, max_row_scan + 1):
+        row_has_text = any(_has_text_or_value(ws.cell(row=r, column=c).value) for c in probe_cols)
+        if row_has_text:
+            last_text_row = r
+            blank_streak = 0
+        else:
+            blank_streak += 1
+            if blank_streak >= 8:
+                break
+    bottom_row = last_text_row + 3
+
+    last_text_col = left_text_col
+    blank_col_streak = 0
+    row_slice_end = max(bottom_row, top_row + 5)
+    for c in range(left_text_col, max_col_scan + 1):
+        col_has_text = any(
+            _has_text_or_value(ws.cell(row=r, column=c).value)
+            for r in range(top_row, row_slice_end + 1)
+        )
+        if col_has_text:
+            last_text_col = c
+            blank_col_streak = 0
+        else:
+            blank_col_streak += 1
+            if blank_col_streak >= 3:
+                break
+    entry_start_col = last_text_col + 4
+    return (top_row, bottom_row, left_text_col, entry_start_col)
+
+def parse_sheet_instruction(task_text):
+    if ":" not in task_text:
+        return None, task_text
+    left, right = task_text.split(":", 1)
+    return left.strip(), right.strip()
+
+def compute_minimal_result(ws, instruction):
+    """
+    Strict spreadsheet output: return only compact values.
+    Supported forms:
+    - LITERAL <value>
+    - SUM <A>
+    - COUNT <A>
+    """
+    text = instruction.strip()
+    if not text:
+        return ""
+
+    lit = re.match(r"^LITERAL\s+(.+)$", text, flags=re.IGNORECASE)
+    if lit:
+        return lit.group(1).strip()
+
+    sum_m = re.match(r"^SUM\s+([A-Z]+)$", text, flags=re.IGNORECASE)
+    if sum_m:
+        col = column_index_from_string(sum_m.group(1).upper())
+        total = 0.0
+        for r in range(1, ws.max_row + 1):
+            v = ws.cell(row=r, column=col).value
+            if isinstance(v, (int, float)):
+                total += v
+        return str(int(total) if float(total).is_integer() else total)
+
+    cnt_m = re.match(r"^COUNT\s+([A-Z]+)$", text, flags=re.IGNORECASE)
+    if cnt_m:
+        col = column_index_from_string(cnt_m.group(1).upper())
+        count = 0
+        for r in range(1, ws.max_row + 1):
+            if _has_text_or_value(ws.cell(row=r, column=col).value):
+                count += 1
+        return str(count)
+
+    return text.splitlines()[0].strip()
+
+def write_result_in_first_blank(ws, value, top_row, bottom_row, entry_start_col):
+    for c in range(entry_start_col, entry_start_col + 20):
+        for r in range(top_row, bottom_row + 1):
+            cell = ws.cell(row=r, column=c)
+            if not _has_text_or_value(cell.value):
+                cell.value = value
+                return (r, c)
+    return None
+
+def run_o_operator(wb):
+    tabs = list_tabs_progress(wb)
+    if not tabs:
+        print("No tabs found")
+        return
+
+    task_sheet = wb[tabs[0]]
+    tasks = get_column_a_priority_tasks(task_sheet)
+    if not tasks:
+        print("No priority tasks in first tab column A")
+    else:
+        print(f"Priority tasks loaded: {len(tasks)}")
+
+    completed_tabs = []
+    for tab_name in tabs:
+        ws = wb[tab_name]
+        top_row, bottom_row, left_col, entry_col = detect_ostensible_borders(ws)
+        print(
+            f"[TAB] {tab_name} | border rows {top_row}-{bottom_row} "
+            f"| left {get_column_letter(left_col)} | entry {get_column_letter(entry_col)}"
+        )
+
+        matched_task = None
+        for task in tasks:
+            target_sheet, instruction = parse_sheet_instruction(task)
+            if target_sheet and target_sheet.lower() != tab_name.lower():
+                continue
+            matched_task = instruction
+            break
+
+        if matched_task:
+            result = compute_minimal_result(ws, matched_task)
+            loc = write_result_in_first_blank(ws, result, top_row, bottom_row, entry_col)
+            if loc:
+                r, c = loc
+                print(f"[WRITE] {tab_name}!{get_column_letter(c)}{r} <- {result}")
+            else:
+                print(f"[WRITE] {tab_name}: no blank cell in entry border")
+
+        completed_tabs.append(tab_name)
+        print(f"[DONE] {tab_name}")
+
+    print(f"Reached last tab: {completed_tabs[-1]}")
+    print("Tab completion tracker:")
+    for name in completed_tabs:
+        print(f"- {name}")
+    print("No additional tabs searched.")
+
 def task_new_pool(wb, row):
-    # Expected: TargetSheet, Domain, Notes
     target_sheet = row.get("TargetSheet")
     domain = (row.get("Domain") or "").strip().upper()
     notes = row.get("Notes") or ""
-
     if not target_sheet:
         print("NEW_POOL missing TargetSheet; skipping")
         return
-
     ws = ensure_sheet(wb, target_sheet)
-
-    # Define some default columns depending on domain
     if domain == "MARKETING":
         headers = ["ItemID", "Channel", "Audience", "Message", "Cost", "ExpectedReach", "SourceNotes"]
     elif domain == "FINANCE":
@@ -468,8 +662,6 @@ def task_new_pool(wb, row):
         headers = ["ContactID", "Segment", "Need", "PainPoint", "Comment", "Source"]
     else:
         headers = ["ItemID", "Type", "Description", "Value1", "Value2", "Notes"]
-
-    # Only initialize if the sheet is blank
     if ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None:
         for col, h in enumerate(headers, start=1):
             ws.cell(row=1, column=col, value=h)
@@ -480,33 +672,24 @@ def task_summarize_pool(wb, row):
     source_sheet = row.get("TargetSheet")
     output_sheet = row.get("OutputSheet") or f"{source_sheet}_Summary"
     description = row.get("Description") or ""
-
     if not source_sheet or source_sheet not in wb.sheetnames:
         print("SUMMARIZE_POOL: source sheet not found; skipping")
         return
-
     src_df = pd.DataFrame(wb[source_sheet].values)
     if src_df.empty:
         print("SUMMARIZE_POOL: source sheet empty; skipping")
         return
-
-    # Use first row as header
     src_df.columns = src_df.iloc[0]
     src_df = src_df[1:]
-
     ws_out = ensure_sheet(wb, output_sheet)
     ws_out.delete_rows(1, ws_out.max_row or 1)
-
     ws_out["A1"] = f"Summary of {source_sheet}"
     ws_out["A2"] = description
-
-    # Simple field completeness stats
     start_row = 4
     ws_out[f"A{start_row}"] = "Column"
     ws_out[f"B{start_row}"] = "Non-empty"
     ws_out[f"C{start_row}"] = "Total"
     ws_out[f"D{start_row}"] = "% Filled"
-
     for idx, col in enumerate(src_df.columns, start=1):
         col_series = src_df[col]
         non_empty = col_series.notna().sum()
@@ -523,72 +706,53 @@ def task_decision_matrix(wb, row):
     output_sheet = row.get("OutputSheet") or f"{options_sheet}_Decision"
     criteria_text = row.get("Criteria") or ""
     goal = row.get("Goal") or ""
-
     if not options_sheet or options_sheet not in wb.sheetnames:
         print("DECISION_MATRIX: options sheet not found; skipping")
         return
-
     opt_df = pd.DataFrame(wb[options_sheet].values)
     if opt_df.empty:
         print("DECISION_MATRIX: options sheet empty; skipping")
         return
-
     opt_df.columns = opt_df.iloc[0]
     opt_df = opt_df[1:]
-    # Assume there is an "Option" column
     if "Option" not in opt_df.columns:
         print("DECISION_MATRIX: 'Option' column missing; skipping")
         return
-
     criteria = [c.strip() for c in criteria_text.split(",") if c.strip()]
-
     ws_out = ensure_sheet(wb, output_sheet)
     ws_out.delete_rows(1, ws_out.max_row or 1)
-
     ws_out["A1"] = "Decision Matrix"
     ws_out["A2"] = f"Goal: {goal}"
     ws_out["A3"] = f"Criteria (1-5 rating, higher is better): {', '.join(criteria)}"
-
     header_row = 5
     ws_out[f"A{header_row}"] = "Option"
     for i, c in enumerate(criteria, start=1):
-        col_letter = get_column_letter(i + 1)
-        ws_out[f"{col_letter}{header_row}"] = c
+        ws_out[f"{get_column_letter(i + 1)}{header_row}"] = c
     total_col = get_column_letter(len(criteria) + 2)
     ws_out[f"{total_col}{header_row}"] = "TotalScore"
-
     for idx, (_, opt_row) in enumerate(opt_df.iterrows(), start=1):
         row_i = header_row + idx
         ws_out[f"A{row_i}"] = opt_row["Option"]
-        # Leave criteria cells blank for user to fill
         for j in range(1, len(criteria) + 1):
-            col_letter = get_column_letter(j + 1)
-            ws_out[f"{col_letter}{row_i}"] = None
-        # Add Excel formula for total
+            ws_out[f"{get_column_letter(j + 1)}{row_i}"] = None
         if criteria:
-            first_crit_col = get_column_letter(2)
-            last_crit_col = get_column_letter(len(criteria) + 1)
-            ws_out[f"{total_col}{row_i}"] = f"=SUM({first_crit_col}{row_i}:{last_crit_col}{row_i})"
+            ws_out[f"{total_col}{row_i}"] = f"=SUM(B{row_i}:{get_column_letter(len(criteria) + 1)}{row_i})"
 
-def process_control_sheet(path: Path):
-    wb = load_workbook(path)
+def run_control_tasks_if_present(wb):
     if CONTROL_SHEET not in wb.sheetnames:
-        raise SystemExit(f"No '{CONTROL_SHEET}' sheet found")
-
+        print(f"No '{CONTROL_SHEET}' sheet found; skipping control tasks")
+        return
     control_df = pd.DataFrame(wb[CONTROL_SHEET].values)
     if control_df.empty:
         print("Control sheet empty; nothing to do")
         return
-
     control_df.columns = control_df.iloc[0]
     control_df = control_df[1:]
-
     task_handlers = {
         "NEW_POOL": task_new_pool,
         "SUMMARIZE_POOL": task_summarize_pool,
         "DECISION_MATRIX": task_decision_matrix,
     }
-
     for _, row in control_df.iterrows():
         task_type = (row.get("TaskType") or "").strip().upper()
         if not task_type:
@@ -600,17 +764,21 @@ def process_control_sheet(path: Path):
         print(f"Running task: {task_type}")
         handler(wb, row)
 
+def process_operator(path: Path):
+    wb = load_workbook(path)
+    run_o_operator(wb)
+    run_control_tasks_if_present(wb)
     wb.save(path)
     print(f"Updated workbook saved to {path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Excel-driven business helper")
-    parser.add_argument("workbook", help="Path to .xlsx file")
+    parser = argparse.ArgumentParser(description="O-Operator spreadsheet engine")
+    parser.add_argument("workbook", nargs="?", default="Worthy.xlsx", help="Path to .xlsx file")
     args = parser.parse_args()
     path = Path(args.workbook)
     if not path.exists():
         raise SystemExit(f"Workbook not found: {path}")
-    process_control_sheet(path)
+    process_operator(path)
 
 if __name__ == "__main__":
     main()'''
@@ -2962,7 +3130,7 @@ def run_W(background: str):
 
 def run_O(background: str):
     """Run Operations / Control-Sheet engine (O)."""
-    _exec_engine(O_CODE, "worthy_O", background)
+    _exec_engine(O_CODE, ["worthy_O", WORTHY_XLSX_PATH], background)
 
 
 def _exec_engine(code_str: str, argv_list, background: str):
