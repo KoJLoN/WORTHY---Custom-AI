@@ -27,34 +27,54 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 WORTHY_XLSX_PATH = "Worthy.xlsx"
 
 
+def _read_column_a_until_blank(ws, start_row: int = 1):
+    """Read column A from start_row downward until a blank cell is encountered."""
+    lines = []
+    row = start_row
+    while True:
+        val = ws.cell(row=row, column=1).value
+        if val is None or str(val).strip() == "":
+            break
+        lines.append(str(val))
+        row += 1
+    return lines
+
+
+def _get_primary_sheet(wb):
+    """Return the first tab/sheet in workbook order."""
+    if not wb.sheetnames:
+        raise SystemExit("Worthy workbook has no sheets.")
+    return wb[wb.sheetnames[0]]
+
+
+def _ensure_sheet1_alias(path: Path):
+    """
+    Ensure engines that expect a literal 'Sheet1' can still run even when
+    the first workbook tab has a custom name.
+    """
+    wb = openpyxl.load_workbook(path)
+    if "Sheet1" in wb.sheetnames:
+        return
+    primary = _get_primary_sheet(wb)
+    primary.title = "Sheet1"
+    wb.save(path)
+
+
 def get_selector_and_background():
     """
-    Read Sheet1!A1 as selector (W/O/R/T/H/Y)
-    and Sheet1!A3 downward as background text.
+    Read first-tab A1 as selector (W/O/R/T/H/Y)
+    and first-tab A3 downward as background text until blank.
     """
     path = Path(WORTHY_XLSX_PATH)
     if not path.exists():
         raise SystemExit(f"Worthy workbook not found: {path!s}")
 
     wb = openpyxl.load_workbook(path)
-    if "Sheet1" not in wb.sheetnames:
-        raise SystemExit("Sheet1 not found in Worthy.xlsx")
-
-    ws = wb["Sheet1"]
+    ws = _get_primary_sheet(wb)
     selector_val = ws["A1"].value or ""
     selector = str(selector_val).strip().upper()
 
-    # A3 downward = background text
-    lines = []
-    row = 3
-    while True:
-        val = ws.cell(row=row, column=1).value
-        if val is None:
-            break
-        lines.append(str(val))
-        row += 1
-
-    background = "\n".join(lines).strip()
+    background = "\n".join(_read_column_a_until_blank(ws, start_row=3)).strip()
     return selector, background
 
 
@@ -483,7 +503,39 @@ def _has_text_or_value(v):
         return v.strip() != ""
     return True
 
-def detect_ostensible_borders(ws):
+def _has_pixel_signal(cell):
+    """
+    Heuristic pixel-level fallback using visual formatting artifacts.
+    This is useful when text extraction is empty but a box/region is
+    visually marked and should still be considered present.
+    """
+    fill = getattr(cell, "fill", None)
+    border = getattr(cell, "border", None)
+    font = getattr(cell, "font", None)
+
+    fill_used = bool(fill and getattr(fill, "fill_type", None))
+    border_used = bool(
+        border
+        and any(
+            getattr(getattr(border, edge), "style", None)
+            for edge in ("left", "right", "top", "bottom")
+        )
+    )
+    font_used = bool(
+        font and (
+            getattr(font, "bold", False)
+            or getattr(font, "italic", False)
+            or getattr(font, "underline", None)
+        )
+    )
+    metadata_used = bool(cell.comment or cell.hyperlink)
+
+    return fill_used or border_used or font_used or metadata_used
+
+def _cell_is_present(cell, verify_pixels=True):
+    return _has_text_or_value(cell.value) or (verify_pixels and _has_pixel_signal(cell))
+
+def detect_ostensible_borders(ws, verify_pixels=True):
     """
     Border heuristic:
     - Find first row with any text in first 5 active columns
@@ -496,7 +548,7 @@ def detect_ostensible_borders(ws):
     left_text_col = None
     for c in range(1, max_col_scan + 1):
         for r in range(1, min(max_row_scan, 60) + 1):
-            if _has_text_or_value(ws.cell(row=r, column=c).value):
+            if _cell_is_present(ws.cell(row=r, column=c), verify_pixels=verify_pixels):
                 left_text_col = c
                 break
         if left_text_col is not None:
@@ -508,7 +560,7 @@ def detect_ostensible_borders(ws):
 
     top_row = None
     for r in range(1, max_row_scan + 1):
-        if any(_has_text_or_value(ws.cell(row=r, column=c).value) for c in probe_cols):
+        if any(_cell_is_present(ws.cell(row=r, column=c), verify_pixels=verify_pixels) for c in probe_cols):
             top_row = r
             break
     if top_row is None:
@@ -517,7 +569,7 @@ def detect_ostensible_borders(ws):
     last_text_row = top_row
     blank_streak = 0
     for r in range(top_row, max_row_scan + 1):
-        row_has_text = any(_has_text_or_value(ws.cell(row=r, column=c).value) for c in probe_cols)
+        row_has_text = any(_cell_is_present(ws.cell(row=r, column=c), verify_pixels=verify_pixels) for c in probe_cols)
         if row_has_text:
             last_text_row = r
             blank_streak = 0
@@ -532,7 +584,7 @@ def detect_ostensible_borders(ws):
     row_slice_end = max(bottom_row, top_row + 5)
     for c in range(left_text_col, max_col_scan + 1):
         col_has_text = any(
-            _has_text_or_value(ws.cell(row=r, column=c).value)
+            _cell_is_present(ws.cell(row=r, column=c), verify_pixels=verify_pixels)
             for r in range(top_row, row_slice_end + 1)
         )
         if col_has_text:
@@ -592,7 +644,7 @@ def write_result_in_first_blank(ws, value, top_row, bottom_row, entry_start_col)
     for c in range(entry_start_col, entry_start_col + 20):
         for r in range(top_row, bottom_row + 1):
             cell = ws.cell(row=r, column=c)
-            if not _has_text_or_value(cell.value):
+            if not _cell_is_present(cell, verify_pixels=True):
                 cell.value = value
                 return (r, c)
     return None
@@ -613,7 +665,7 @@ def run_o_operator(wb):
     completed_tabs = []
     for tab_name in tabs:
         ws = wb[tab_name]
-        top_row, bottom_row, left_col, entry_col = detect_ostensible_borders(ws)
+        top_row, bottom_row, left_col, entry_col = detect_ostensible_borders(ws, verify_pixels=True)
         print(
             f"[TAB] {tab_name} | border rows {top_row}-{bottom_row} "
             f"| left {get_column_letter(left_col)} | entry {get_column_letter(entry_col)}"
@@ -3261,6 +3313,8 @@ def _exec_engine(code_str: str, argv_list, background: str):
     ns = {}
     ns["__name__"] = "__main__"
     ns["WORTHY_BACKGROUND"] = background
+    ns["WORTHY_READ_COLUMN_A"] = _read_column_a_until_blank
+    ns["WORTHY_PRIMARY_SHEET"] = _get_primary_sheet
     sys.argv = argv_list
 
     exec(code_str, ns, ns)
@@ -3338,9 +3392,12 @@ def run_Y(background: str):
 
 
 def main():
+    path = Path(WORTHY_XLSX_PATH)
+    if path.exists():
+        _ensure_sheet1_alias(path)
     selector, background = get_selector_and_background()
     if not selector:
-        raise SystemExit("Sheet1!A1 is empty. Put one of W/O/R/T/H/Y there.")
+        raise SystemExit("First tab A1 is empty. Put one of W/O/R/T/H/Y there.")
 
     engines = {
         "W": run_W,
@@ -3354,7 +3411,7 @@ def main():
     runner = engines.get(selector)
     if runner is None:
         raise SystemExit(
-            f"Unknown engine selector {selector!r} in Sheet1!A1. "
+            f"Unknown engine selector {selector!r} in first tab A1. "
             f"Expected one of W/O/R/T/H/Y."
         )
 
