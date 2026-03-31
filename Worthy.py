@@ -5,7 +5,7 @@ This file embeds six original engines:
 W — Writer
 O — Operations / Control-Sheet
 R — Research / Mission Planner
-T — Task Router / Analysis / Survey / Visualization
+T — Technical Engineer / Iterative Solution Engineering
 H — Life Planner / Psychometric System
 Y — Persona / YOU-Mode Engine
 
@@ -81,7 +81,6 @@ Fully autonomous local writing engine:
 """
 
 import sys
-import math
 import random
 import time
 import re
@@ -2210,234 +2209,232 @@ if __name__ == "__main__":
 #===ENGINE_T_START===
 T_CODE = r'''import os
 import io
+import json
 import base64
 import openpyxl
 import matplotlib.pyplot as plt
 from openai import OpenAI
 
-# ---------------------------------------------------
-# CONFIG / CLIENT
-# ---------------------------------------------------
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-4.1-mini"
+MAX_ITERATIONS = 8
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-def ask_model(prompt):
-    """Send a text prompt to OpenAI and return model output."""
+
+def _safe_str(value):
+    return "" if value is None else str(value).strip()
+
+
+def read_prompt_from_sheet1(ws):
+    """Read desired prompt from Sheet1, preferring A1 then A2 downward."""
+    first = _safe_str(ws["A1"].value)
+    if first and first.upper() not in {"W", "O", "R", "T", "H", "Y"}:
+        return first
+
+    lines = []
+    for row in range(2, ws.max_row + 1):
+        v = _safe_str(ws.cell(row=row, column=1).value)
+        if not v:
+            if lines:
+                break
+            continue
+        lines.append(v)
+    return "\n".join(lines).strip()
+
+
+def get_or_create_next_sheet(wb):
+    """Use the following page after Sheet1. Fallback to Sheet2."""
+    if "Sheet1" in wb.sheetnames:
+        idx = wb.sheetnames.index("Sheet1")
+        if idx + 1 < len(wb.sheetnames):
+            return wb[wb.sheetnames[idx + 1]]
+    return wb["Sheet2"] if "Sheet2" in wb.sheetnames else wb.create_sheet("Sheet2")
+
+
+def ensure_output_header(ws):
+    if ws.max_row == 1 and ws["A1"].value is None:
+        ws["A1"] = "Iteration"
+        ws["B1"] = "Status"
+        ws["C1"] = "EngineerPlanJSON"
+        ws["D1"] = "Summary"
+
+
+def load_previous_iterations(ws):
+    records = []
+    for row in range(2, ws.max_row + 1):
+        iteration = ws.cell(row=row, column=1).value
+        status = _safe_str(ws.cell(row=row, column=2).value)
+        payload = _safe_str(ws.cell(row=row, column=3).value)
+        summary = _safe_str(ws.cell(row=row, column=4).value)
+        if iteration is None and not status and not payload and not summary:
+            continue
+        records.append({
+            "iteration": iteration,
+            "status": status,
+            "payload": payload,
+            "summary": summary,
+        })
+    return records
+
+
+def ask_technical_engineer(prompt_text, prior_records, iteration):
+    history = []
+    for rec in prior_records[-6:]:
+        history.append({
+            "iteration": rec.get("iteration"),
+            "status": rec.get("status"),
+            "summary": rec.get("summary"),
+        })
+
+    prompt = f"""
+You are T-Technical Engineer.
+
+MISSION:
+Engineer a solution to the user's prompt by iterating and testing ideas.
+Focus on engineering artifacts: image visualization plans, graphs, simulations,
+tradeoff analysis, technical architecture, and implementation experiments.
+
+USER PROMPT:
+{prompt_text}
+
+CURRENT ITERATION:
+{iteration}
+
+PRIOR ITERATION LOG (vertical history from worksheet):
+{json.dumps(history, indent=2)}
+
+Return STRICT JSON with these keys:
+- status: one of ["ITERATE", "SOLVED", "BLOCKED"]
+- summary: short technical update
+- bottlenecks: list of strings
+- development_time: string estimate
+- cost_estimate: string estimate
+- risk_level: one of ["LOW", "MEDIUM", "HIGH"]
+- feasibility: one of ["LOW", "MEDIUM", "HIGH"]
+- technical_challenges: list of strings
+- simulation_plan: concise simulation/test design
+- graph_plan: concise graph/visualization plan
+- next_actions: list of concrete engineering tasks
+
+Important:
+- If prior results are insufficient, set status to ITERATE.
+- If solution is feasible and validated enough, set status to SOLVED.
+- If impossible with current constraints, set status to BLOCKED.
+JSON only.
+"""
+
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
     )
-    return response.choices[0].message["content"]
+    return response.choices[0].message.content
 
-# ---------------------------------------------------
-# INSTRUCTION PARSER
-# ---------------------------------------------------
 
-def load_instructions(sheet):
-    """Read Sheet1 column A until first blank."""
-    instructions = []
-    for row in sheet.iter_rows(min_col=1, max_col=1):
-        value = row[0].value
-        if value is None:
-            break
-        instructions.append(value)
-    return instructions
+def parse_json_response(text):
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:].strip()
+    return json.loads(cleaned)
 
-# ---------------------------------------------------
-# SHEET SCANNING
-# ---------------------------------------------------
 
-def detect_task_sheets(workbook):
-    """
-    Every sheet except:
-      - Sheet1
-      - Any ending with "A"
-    is considered a task sheet.
-    """
-    tasks = []
-
-    for name in workbook.sheetnames:
-        if name == "Sheet1":
+def generate_iteration_plot(ws, upto_row):
+    scores = []
+    for row in range(2, upto_row + 1):
+        risk = _safe_str(ws.cell(row=row, column=3).value)
+        if not risk:
             continue
-        if name.endswith("A"):
+        try:
+            payload = json.loads(risk)
+        except Exception:
             continue
+        fea = payload.get("feasibility", "MEDIUM")
+        lvl = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(str(fea).upper(), 2)
+        scores.append((row - 1, lvl))
 
-        data_sheet = workbook[name]
-        output_name = name + "A"
-        output_sheet = workbook[output_name] if output_name in workbook.sheetnames else None
+    if not scores:
+        return ""
 
-        tasks.append((name, data_sheet, output_sheet))
+    xs = [x for x, _ in scores]
+    ys = [y for _, y in scores]
 
-    return tasks
-
-# ---------------------------------------------------
-# OUTPUT WRITER
-# ---------------------------------------------------
-
-def write_output(sheet, text):
-    """Write output text line-by-line starting at A1."""
-    sheet.delete_rows(1, sheet.max_row)  # wipe
-    for i, line in enumerate(text.split("\n"), 1):
-        sheet.cell(row=i, column=1).value = line
-
-# ---------------------------------------------------
-# TASK MODULES (ANALYSIS / SURVEY / VISUALIZATION)
-# ---------------------------------------------------
-
-# -------------------------
-# DATA ANALYSIS
-# -------------------------
-def run_analysis(sheet, instructions):
-    rows = list(sheet.iter_rows(values_only=True))
-    num_rows = len(rows)
-    num_cols = len(rows[0]) if num_rows > 0 else 0
-
-    raw_text = ""
-    for r in rows:
-        raw_text += " | ".join([str(x) for x in r]) + "\n"
-
-    prompt = f"""
-You are an elite data analyst.
-
-INSTRUCTIONS:
-{instructions}
-
-DATA:
-{raw_text}
-
-Provide a full analysis including:
-- Structure
-- Patterns
-- Outliers
-- Strategic implications
-- Blind spots
-- Recommended next actions
-"""
-    ai_output = ask_model(prompt)
-
-    summary = (
-        f"ROWS: {num_rows}\n"
-        f"COLUMNS: {num_cols}\n\n"
-        f"ANALYSIS OUTPUT:\n{ai_output}"
-    )
-
-    return summary
-
-# -------------------------
-# SURVEY GENERATION
-# -------------------------
-def run_survey(sheet, instructions):
-    questions = []
-    for row in sheet.iter_rows(values_only=True):
-        if row[0]:
-            questions.append(row[0])
-
-    prompt = f"""
-You are a psychometric survey designer.
-
-INSTRUCTIONS:\n{instructions}
-
-SEED QUESTIONS:\n{questions}
-
-Generate a full survey including:
-- Sections
-- Likert questions
-- Behavioral items
-- Demographics
-- Optional branching logic
-"""
-
-    return ask_model(prompt)
-
-# -------------------------
-# VISUALIZATION
-# -------------------------
-def run_visualization(sheet, instructions):
-    values = []
-
-    for row in sheet.iter_rows(values_only=True):
-        for cell in row:
-            if isinstance(cell, (int, float)):
-                values.append(cell)
-
-    if not values:
-        return "No numeric data found for visualization."
-
-    fig, ax = plt.subplots()
-    ax.plot(values)
-    ax.set_title("Auto Visualization")
-    ax.set_xlabel("Index")
-    ax.set_ylabel("Value")
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(xs, ys, marker="o")
+    ax.set_title("T-Technical Engineer Feasibility Trend")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Feasibility (1=Low,3=High)")
+    ax.set_ylim(0.8, 3.2)
+    ax.grid(True, alpha=0.3)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png")
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
     buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
 
-    encoded = base64.b64encode(buf.read()).decode("utf-8")
 
-    return (
-        "Visualization created.\n"
-        "BASE64 PNG (copy and decode to view):\n"
-        + encoded
-    )
+def append_iteration(ws, iteration, payload):
+    row = ws.max_row + 1
+    ws.cell(row=row, column=1).value = iteration
+    ws.cell(row=row, column=2).value = payload.get("status", "ITERATE")
+    ws.cell(row=row, column=3).value = json.dumps(payload, ensure_ascii=False)
+    ws.cell(row=row, column=4).value = payload.get("summary", "")
+    return row
 
-# ---------------------------------------------------
-# TASK ROUTER
-# ---------------------------------------------------
-
-def route_task(task_name, data_sheet, output_sheet, instructions):
-    """Pulls the non-numeric prefix of the sheet name to determine task."""
-    root = ''.join([c for c in task_name if not c.isdigit()]).lower()
-
-    if root == "dataanalysis":
-        return run_analysis(data_sheet, instructions)
-
-    elif root == "survey":
-        return run_survey(data_sheet, instructions)
-
-    elif root == "visualization":
-        return run_visualization(data_sheet, instructions)
-
-    else:
-        return f"Unknown task type '{task_name}'. No defined handler."
-
-# ---------------------------------------------------
-# MAIN PIPELINE
-# ---------------------------------------------------
 
 def main():
     file = "Worthy.xlsx"
-
-    print("Loading workbook:", file)
     wb = openpyxl.load_workbook(file)
 
-    # 1. get instructions
-    print("Reading Sheet1 instructions...")
-    instructions = load_instructions(wb["Sheet1"])
+    if "Sheet1" not in wb.sheetnames:
+        raise SystemExit("Sheet1 not found. Expected user prompt in Sheet1.")
 
-    # 2. find task sheets
-    tasks = detect_task_sheets(wb)
+    ws_prompt = wb["Sheet1"]
+    ws_out = get_or_create_next_sheet(wb)
+    ensure_output_header(ws_out)
 
-    # 3. process all tasks
-    for name, data_sheet, output_sheet in tasks:
-        print(f"Running task → {name}")
+    prompt_text = read_prompt_from_sheet1(ws_prompt)
+    if not prompt_text:
+        raise SystemExit("No prompt found in Sheet1 column A.")
 
-        result = route_task(name, data_sheet, output_sheet, instructions)
+    previous = load_previous_iterations(ws_out)
+    solved_or_blocked = any(r.get("status") in {"SOLVED", "BLOCKED"} for r in previous)
 
-        if output_sheet:
-            write_output(output_sheet, result)
-        else:
-            print("WARNING: No paired output sheet found for", name)
+    if solved_or_blocked:
+        wb.save(file)
+        print("T-Technical Engineer: prior run already reached SOLVED/BLOCKED.")
+        return
 
-    wb.save(file)
-    print("\nAll tasks completed successfully.")
+    iteration = len(previous) + 1
+    while iteration <= MAX_ITERATIONS:
+        print(f"T-Technical Engineer iteration {iteration}...")
 
-# ---------------------------------------------------
-# RUN
-# ---------------------------------------------------
+        raw = ask_technical_engineer(prompt_text, previous, iteration)
+        payload = parse_json_response(raw)
+
+        row = append_iteration(ws_out, iteration, payload)
+        chart_b64 = generate_iteration_plot(ws_out, row)
+        if chart_b64:
+            ws_out.cell(row=row, column=5).value = chart_b64
+
+        wb.save(file)
+
+        status = str(payload.get("status", "ITERATE")).upper()
+        previous = load_previous_iterations(ws_out)
+
+        if status in {"SOLVED", "BLOCKED"}:
+            print(f"T-Technical Engineer finished with status={status}.")
+            break
+
+        iteration += 1
+
+    if iteration > MAX_ITERATIONS:
+        print("T-Technical Engineer reached max iterations; last status kept as ITERATE.")
+
+
 if __name__ == "__main__":
     main()'''
 
@@ -3200,7 +3197,7 @@ def run_R(background: str):
    
 
 def run_T(background: str):
-    """Run Task Router / Analysis / Survey / Visualization engine (T)."""
+    """Run T-Technical Engineer iterative engineering engine (T)."""
     _exec_engine(T_CODE, "worthy_T", background)
 
 
