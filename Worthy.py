@@ -463,6 +463,20 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 CONTROL_SHEET = "Control"
 MAX_TABS = 20
 
+def module_control_sheet_name(wb):
+    """
+    Prefer module-prefixed control tabs (O1, O2, ...), fallback to legacy Control.
+    """
+    prefixed = []
+    for name in wb.sheetnames:
+        m = re.fullmatch(r"O(\d+)", str(name))
+        if m:
+            prefixed.append((int(m.group(1)), name))
+    if prefixed:
+        prefixed.sort(key=lambda x: x[0])
+        return prefixed[0][1]
+    return CONTROL_SHEET
+
 def ensure_sheet(wb, name):
     if name in wb.sheetnames:
         return wb[name]
@@ -790,10 +804,11 @@ def task_decision_matrix(wb, row):
             ws_out[f"{total_col}{row_i}"] = f"=SUM(B{row_i}:{get_column_letter(len(criteria) + 1)}{row_i})"
 
 def run_control_tasks_if_present(wb):
-    if CONTROL_SHEET not in wb.sheetnames:
-        print(f"No '{CONTROL_SHEET}' sheet found; skipping control tasks")
+    control_name = module_control_sheet_name(wb)
+    if control_name not in wb.sheetnames:
+        print(f"No '{CONTROL_SHEET}' or 'O#' sheet found; skipping control tasks")
         return
-    control_df = pd.DataFrame(wb[CONTROL_SHEET].values)
+    control_df = pd.DataFrame(wb[control_name].values)
     if control_df.empty:
         print("Control sheet empty; nothing to do")
         return
@@ -817,6 +832,7 @@ def run_control_tasks_if_present(wb):
 
 def process_operator(path: Path):
     wb = load_workbook(path)
+    ensure_sheet(wb, module_control_sheet_name(wb))
     run_o_operator(wb)
     run_control_tasks_if_present(wb)
     wb.save(path)
@@ -2296,12 +2312,20 @@ def read_prompt_from_sheet1(ws):
 
 
 def get_or_create_next_sheet(wb):
-    """Use the following page after Sheet1. Fallback to Sheet2."""
-    if "Sheet1" in wb.sheetnames:
-        idx = wb.sheetnames.index("Sheet1")
-        if idx + 1 < len(wb.sheetnames):
-            return wb[wb.sheetnames[idx + 1]]
-    return wb["Sheet2"] if "Sheet2" in wb.sheetnames else wb.create_sheet("Sheet2")
+    """
+    Use module-owned T tabs first (T1, T2, ...), then fallback to legacy Sheet2.
+    """
+    t_tabs = []
+    for name in wb.sheetnames:
+        m = re.fullmatch(r"T(\d+)", str(name))
+        if m:
+            t_tabs.append((int(m.group(1)), name))
+    if t_tabs:
+        t_tabs.sort(key=lambda x: x[0])
+        return wb[t_tabs[0][1]]
+    if "Sheet2" in wb.sheetnames:
+        return wb["Sheet2"]
+    return wb.create_sheet("T1")
 
 
 def ensure_output_header(ws):
@@ -2516,10 +2540,10 @@ except NameError:
 
 client = OpenAI()
 
-SHEET_QUESTIONS = "Questions"
-SHEET_ANSWERS = "AnswersHistory"
-SHEET_PROFILE = "Profile"
-SHEET_PLAN = "Plan"
+SHEET_QUESTIONS = "H1"
+SHEET_ANSWERS = "H2"
+SHEET_PROFILE = "H3"
+SHEET_PLAN = "H4"
 
 LOG_FILE = None
 AUTOSAVE_EVERY = 25
@@ -3102,10 +3126,21 @@ def _sheet_or_none(wb, name):
 def load_signal_sources(xlsx_path="Worthy.xlsx"):
     wb = openpyxl.load_workbook(xlsx_path)
     sheet1 = wb["Sheet1"]
-    sheet2 = wb["Sheet2"]
-    profile = _sheet_or_none(wb, "Profile")
-    plan = _sheet_or_none(wb, "Plan")
-    answers = _sheet_or_none(wb, "AnswersHistory")
+    y_tabs = []
+    for name in wb.sheetnames:
+        m = re.fullmatch(r"Y(\d+)", str(name))
+        if m:
+            y_tabs.append((int(m.group(1)), name))
+    if y_tabs:
+        y_tabs.sort(key=lambda x: x[0])
+        sheet2 = wb[y_tabs[0][1]]
+    elif "Sheet2" in wb.sheetnames:
+        sheet2 = wb["Sheet2"]
+    else:
+        sheet2 = wb.create_sheet("Y1")
+    profile = _sheet_or_none(wb, "H3") or _sheet_or_none(wb, "Profile")
+    plan = _sheet_or_none(wb, "H4") or _sheet_or_none(wb, "Plan")
+    answers = _sheet_or_none(wb, "H2") or _sheet_or_none(wb, "AnswersHistory")
 
     # Base source: single raw entry in Sheet1!A1 if user is directly providing text there.
     raw_a1 = (sheet1["A1"].value or "").strip()
@@ -3270,32 +3305,15 @@ if __name__ == "__main__":
     with open("YOU_PROMPT.txt", "w", encoding="utf-8") as f:
         f.write(engram_request + "\n\n---\n\n" + engram_text)
 
-    print(f"Y engine complete. Wrote {prompt_count} engram prompts to Sheet2.")'''
+    print(f"Y engine complete. Wrote {prompt_count} engram prompts to {sheet2.title}.")'''
 
 # ---------------------------------------------------------------------------
 # Engine runners
 # ---------------------------------------------------------------------------
 
-def _exec_engine(code_str: str, argv, background: str):
-    """
-    Execute an engine script in an isolated namespace.
-    `argv` is a full list (e.g. ["worthy_R", "Worthy.xlsx", "--untilgpa", "3.4"])
-    """
-    import sys
-
-    ns = {}
-    ns["__name__"] = "__main__"
-    ns["WORTHY_BACKGROUND"] = background
-
-    # Send argv list directly to the engine
-    sys.argv = argv
-
-    exec(code_str, ns, ns)
-
-
 def run_W(background: str):
     """Run Writer engine (W)."""
-    _exec_engine(W_CODE, "worthy_W", background)
+    _exec_engine(W_CODE, ["worthy_W", WORTHY_XLSX_PATH], background)
 
 
 def run_O(background: str):
@@ -3368,22 +3386,22 @@ def run_R(background: str):
             except:
                 pass
 
-    # ----------- GPA CALCULATOR /\ -----------
-   
+    # ----------- EXECUTE ENGINE -----------
+    _exec_engine(R_CODE, argv, background)
 
 def run_T(background: str):
     """Run T-Technical Engineer iterative engineering engine (T)."""
-    _exec_engine(T_CODE, "worthy_T", background)
+    _exec_engine(T_CODE, ["worthy_T", WORTHY_XLSX_PATH], background)
 
 
 def run_H(background: str):
     """Run Life Planner / Psychometric System engine (H)."""
-    _exec_engine(H_CODE, "worthy_H", background)
+    _exec_engine(H_CODE, ["worthy_H", WORTHY_XLSX_PATH], background)
 
 
 def run_Y(background: str):
     """Run Persona / YOU-Mode engine (Y)."""
-    _exec_engine(Y_CODE, "worthy_Y", background)
+    _exec_engine(Y_CODE, ["worthy_Y", WORTHY_XLSX_PATH], background)
 
 
 # ---------------------------------------------------------------------------
