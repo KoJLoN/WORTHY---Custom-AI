@@ -3046,69 +3046,79 @@ from openai import OpenAI
 
 client = OpenAI()
 
-# ---------------------------------------------------------------
-# STEP 1: READ XLSX DATA
-# ---------------------------------------------------------------
-def load_data(xlsx_path="Worthy.xlsx"):
+def _sheet_or_none(wb, name):
+    return wb[name] if name in wb.sheetnames else None
+
+
+def load_signal_sources(xlsx_path="Worthy.xlsx"):
     wb = openpyxl.load_workbook(xlsx_path)
-
     sheet1 = wb["Sheet1"]
-    sheet3 = wb.get("Sheet3")
-    sheet4 = wb.get("Sheet4")
+    sheet2 = wb["Sheet2"]
+    profile = _sheet_or_none(wb, "Profile")
+    plan = _sheet_or_none(wb, "Plan")
+    answers = _sheet_or_none(wb, "AnswersHistory")
 
-    samples = []
-    for row in sheet1.iter_rows(values_only=True):
-        if row[0] and row[1]:
-            samples.append({"name": row[0], "text": row[1]})
+    # Base source: single raw entry in Sheet1!A1 if user is directly providing text there.
+    raw_a1 = (sheet1["A1"].value or "").strip()
+    selector_tokens = {"W", "O", "R", "T", "H", "Y"}
+    seed_text = raw_a1 if raw_a1.upper() not in selector_tokens else ""
 
-    prompts = []
-    if sheet3:
-        for row in sheet3.iter_rows(values_only=True):
-            if row[0] and row[1]:
-                prompts.append((row[0], row[1]))
+    # Supplemental source: H outputs when available.
+    h_signals = []
+    if profile:
+        for row in profile.iter_rows(min_row=2, values_only=True):
+            if row and row[0] and row[1] not in (None, ""):
+                h_signals.append(f"{row[0]}: {row[1]}")
+    if plan:
+        for row in plan.iter_rows(min_row=2, values_only=True):
+            if row and row[3]:
+                rationale = row[4] if len(row) > 4 and row[4] else ""
+                h_signals.append(f"PlanAction: {row[3]} | Rationale: {rationale}")
+    if answers:
+        for row in answers.iter_rows(min_row=2, values_only=True):
+            if row and len(row) >= 4 and row[2] and row[3]:
+                h_signals.append(f"Q: {row[2]} | A: {row[3]}")
 
-    extra_prompts = []
-    if sheet4:
-        for row in sheet4.iter_rows(values_only=True):
-            if row[0] and row[1]:
-                extra_prompts.append((row[0], row[1]))
+    # Always-available second method: ingest existing Sheet1 information.
+    sample_texts = []
+    for row in sheet1.iter_rows(min_row=2, max_col=1, values_only=True):
+        cell = row[0]
+        if cell and str(cell).strip():
+            sample_texts.append(str(cell).strip())
 
-    return samples, prompts, extra_prompts
+    if seed_text:
+        sample_texts.insert(0, seed_text)
+    if h_signals:
+        sample_texts.extend(h_signals)
 
-# ---------------------------------------------------------------
-# STEP 2: EXTRACT PERSONALITY / STYLE TRAITS
-# ---------------------------------------------------------------
-def extract_traits(samples):
-    texts = [s["text"] for s in samples]
+    return wb, sheet2, sample_texts, h_signals
 
-    # Feature extraction
-    sentence_lengths = []
-    word_counts = []
+
+def extract_traits(texts):
+    texts = [t for t in texts if t and t.strip()]
+    if not texts:
+        texts = ["Direct, practical, reflective, and strategic communication style."]
+
+    sentence_lengths, word_counts = [], []
     vocabulary = set()
-    emotional_words = 0
-    direct_flags = 0
-    formal_flags = 0
-    humor_flags = 0
+    emotional_words = direct_flags = formal_flags = humor_flags = 0
 
-    emotional_terms = ["feel", "emotion", "believe", "care", "love", "hate", "worried"]
-    direct_terms = ["must", "should", "definitely", "clearly", "here’s the truth"]
-    formal_terms = ["therefore", "consequently", "thus", "hence"]
-    humor_terms = ["lol", "haha", "funny", "sarcasm"]
+    emotional_terms = {"feel", "emotion", "believe", "care", "love", "hate", "worried"}
+    direct_terms = {"must", "should", "definitely", "clearly", "truth"}
+    formal_terms = {"therefore", "consequently", "thus", "hence"}
+    humor_terms = {"lol", "haha", "funny", "sarcasm"}
 
     for text in texts:
-        words = text.split()
+        words = [w for w in text.split() if w.strip()]
+        if not words:
+            continue
         sentences = re.split(r"[.!?]", text)
-
-        for s in sentences:
-            sl = len(s.split())
-            if sl > 0:
-                sentence_lengths.append(sl)
-
+        sentence_lengths.extend([len(s.split()) for s in sentences if s.strip()])
         word_counts.append(len(words))
-        vocabulary.update([w.lower() for w in words])
+        vocabulary.update(w.lower() for w in words)
 
         for w in words:
-            wl = w.lower()
+            wl = re.sub(r"[^a-z]", "", w.lower())
             if wl in emotional_terms:
                 emotional_words += 1
             if wl in direct_terms:
@@ -3118,97 +3128,100 @@ def extract_traits(samples):
             if wl in humor_terms:
                 humor_flags += 1
 
-    # Build Persona Vector (0–100 scales)
-    persona = {
-        "VocabularyDensity": min(int((len(vocabulary) / sum(word_counts)) * 1000), 100),
-        "AverageSentenceLength": min(int(mean(sentence_lengths) / 3), 100),
-        "Directness": min(int((direct_flags / len(texts)) * 200), 100),
-        "Formality": min(int((formal_flags / len(texts)) * 200), 100),
-        "EmotionalTransparency": min(int((emotional_words / sum(word_counts)) * 3000), 100),
-        "HumorUsage": min(int((humor_flags / len(texts)) * 200), 100),
-        "StrategicThinking": 88,  # optional hardcoded boost
-        "ConsistencyOfVoice": 95  # confidence metric
+    total_words = max(sum(word_counts), 1)
+    total_texts = max(len(texts), 1)
+    avg_sentence = mean(sentence_lengths) if sentence_lengths else 12
+
+    return {
+        "VocabularyDensity": min(int((len(vocabulary) / total_words) * 1000), 100),
+        "AverageSentenceLength": min(int(avg_sentence * 4), 100),
+        "Directness": min(int((direct_flags / total_texts) * 200), 100),
+        "Formality": min(int((formal_flags / total_texts) * 200), 100),
+        "EmotionalTransparency": min(int((emotional_words / total_words) * 3000), 100),
+        "HumorUsage": min(int((humor_flags / total_texts) * 200), 100),
+        "StrategicThinking": 90,
+        "ConsistencyOfVoice": 92,
     }
 
-    return persona
 
-# ---------------------------------------------------------------
-# STEP 3: CREATE THE “YOU PROMPT”
-# ---------------------------------------------------------------
-def build_you_prompt(persona, samples):
-    formatted_traits = "\n".join([f"- {k}: {v}%" for k, v in persona.items()])
+def build_engram_prompt(persona, h_signals, texts):
+    traits = "\n".join([f"- {k}: {v}%" for k, v in persona.items()])
+    h_block = "\n".join([f"- {x}" for x in h_signals[:40]]) if h_signals else "- None available"
+    examples = "\n".join([f"- {t[:220]}" for t in texts[:20]])
 
-    writing_examples = "\n".join(
-        [f"\n### Example: {s['name']}\n{s['text']}\n" for s in samples]
-    )
+    return f"""Create a high-fidelity personality engram for one target person.
 
-    prompt = f"""
-You are now operating in “YOU-MODE”.
+SOURCE PRIORITY:
+1) Use H-module signals as supplements when available.
+2) Always use direct text evidence from workbook entries as the second method.
 
-This model replicates the user's thinking patterns, writing style, and decision logic based on analyzed samples.
+PERSONA VECTOR:
+{traits}
 
-## PERSONA VECTOR (Percent Likelihood Traits)
-{formatted_traits}
+H-MODULE SIGNALS:
+{h_block}
 
-## YOUR WRITING STYLE & SAMPLE ANALYSIS
-{writing_examples}
+EVIDENCE SNIPPETS:
+{examples}
 
-## OPERATING RULES
-1. Respond exactly as the user would.
-2. Maintain tone, structure, vocabulary, pacing, and implicit reasoning patterns.
-3. Use the Persona Vector as governing heuristics for all responses.
-4. When faced with ambiguity, choose responses that maximize alignment with:
-   - StrategicThinking
-   - Directness
-   - EmotionalTransparency (percentage threshold)
-5. Never break character unless asked.
+Design prompts that make replication robust across:
+- Vocal cadence / rhythm
+- Word choices and sentence structure
+- Thought process and decision logic
+- Regional dialect and idioms
+- Values, beliefs, worldview anchors
+- Known facts and biographical constraints
 
-BEGIN.
-"""
+Output format:
+Return a numbered list of prompts. Each prompt should be self-contained and deployable."""
 
-    return prompt
 
-# ---------------------------------------------------------------
-# STEP 4: PREDICT RESPONSES TO NEW PROMPTS
-# ---------------------------------------------------------------
-def predict_responses(you_prompt, prompts):
-    results = []
+def write_prompts_to_sheet2(sheet2, engram_text):
+    # Reset only output area in A:C to keep behavior deterministic.
+    for r in range(1, sheet2.max_row + 1):
+        for c in range(1, 4):
+            sheet2.cell(row=r, column=c).value = None
 
-    for name, text in prompts:
-        completion = client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": you_prompt},
-                {"role": "user", "content": text}
-            ]
-        )
+    sheet2["A1"] = "PromptID"
+    sheet2["B1"] = "EngramPrompt"
+    sheet2["C1"] = "Source"
 
-        answer = completion.choices[0].message.content
-        results.append((name, text, answer))
+    lines = [ln.strip() for ln in engram_text.splitlines() if ln.strip()]
+    row = 2
+    prompt_num = 1
+    for ln in lines:
+        normalized = re.sub(r"^\d+[\).\-\s]+", "", ln).strip()
+        if len(normalized) < 10:
+            continue
+        sheet2.cell(row=row, column=1).value = f"Y-P{prompt_num:03d}"
+        sheet2.cell(row=row, column=2).value = normalized
+        sheet2.cell(row=row, column=3).value = "Y-Engram"
+        row += 1
+        prompt_num += 1
 
-    return results
+    return prompt_num - 1
 
-# ---------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------
+
 if __name__ == "__main__":
-    samples, prompts, extra_prompts = load_data("Worthy.xlsx")
-    persona = extract_traits(samples)
-    you_prompt = build_you_prompt(persona, samples)
+    wb, sheet2, texts, h_signals = load_signal_sources("Worthy.xlsx")
+    persona = extract_traits(texts)
+    engram_request = build_engram_prompt(persona, h_signals, texts)
 
-    # Save system prompt
+    completion = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {"role": "system", "content": "You are an expert persona modeling and prompt-engineering architect."},
+            {"role": "user", "content": engram_request},
+        ],
+    )
+    engram_text = completion.choices[0].message.content or ""
+    prompt_count = write_prompts_to_sheet2(sheet2, engram_text)
+    wb.save("Worthy.xlsx")
+
     with open("YOU_PROMPT.txt", "w", encoding="utf-8") as f:
-        f.write(you_prompt)
+        f.write(engram_request + "\n\n---\n\n" + engram_text)
 
-    # Predict responses
-    all_prompts = prompts + extra_prompts
-    results = predict_responses(you_prompt, all_prompts)
-
-    with open("predicted_responses.txt", "w", encoding="utf-8") as f:
-        for name, text, answer in results:
-            f.write(f"\n### {name}\nPrompt: {text}\n\nPredicted Response:\n{answer}\n---\n")
-
-    print("YOU_PROMPT.txt and predicted_responses.txt created.")'''
+    print(f"Y engine complete. Wrote {prompt_count} engram prompts to Sheet2.")'''
 
 # ---------------------------------------------------------------------------
 # Engine runners
