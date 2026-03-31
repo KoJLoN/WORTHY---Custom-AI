@@ -2714,6 +2714,8 @@ KNOWN ANSWERS FROM A SEPARATE SURVEY (if any):
 Using only what is reasonably implied:
 
 1. Focus especially on:
+   - PsychometricSignals
+   - SociologicalFactors
    - PersonalityTraits
    - CulturalBackground
    - FamilyExpectations
@@ -2723,6 +2725,8 @@ Using only what is reasonably implied:
    - LearningStyle
    - Values
    - RelationshipPatterns
+   - StrategicPosture
+   - EquilibriumForecast
 
 2. For each dimension where you have enough signal, create **2–4 short bullets**.
 3. If there really is not enough information for a dimension, skip it.
@@ -2730,9 +2734,9 @@ Using only what is reasonably implied:
 Return a **JSON list** of objects. Each object must have:
 
 - "dimension": one of
-  ["PersonalityTraits","CulturalBackground","FamilyExpectations",
+  ["PsychometricSignals","SociologicalFactors","PersonalityTraits","CulturalBackground","FamilyExpectations",
    "SocioeconomicGoals","MentalHealthInfluences","WorkStyle",
-   "LearningStyle","Values","RelationshipPatterns"]
+   "LearningStyle","Values","RelationshipPatterns","StrategicPosture","EquilibriumForecast"]
 - "label": a short 2–6 word label
 - "explanation": 1–2 sentences explaining what you are inferring and why.
 
@@ -2768,6 +2772,93 @@ Answer with JSON only, no commentary.
         return result
     except Exception as e:
         logging.error("Error during background-based inference: %s", e)
+        return []
+
+
+def infer_equilibrium_steps(background: str,
+                            answers: Dict[str, Any],
+                            profile_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    compact_answers = {k: v for k, v in answers.items() if v not in (None, "")}
+    profile_payload = [row for row in profile_rows if row.get("trait")]
+
+    prompt = f"""
+You are a predictive human-factors modeler.
+
+Goal:
+- Infer what this person is likely like (psychometric + sociological + strategic posture).
+- Predict likely pushback and strategic responses from other actors.
+- Use game-theory framing and forecast a likely equilibrium path.
+
+Rules:
+- Create a sequence of exactly 8 steps.
+- Think one step at a time.
+- At each step, read all prior steps and remain consistent with them.
+- Each step must include:
+  1) actor
+  2) action
+  3) rationale
+  4) impact_on_equilibrium
+- Keep each field concise and non-clinical.
+- Do not diagnose mental illnesses.
+
+BACKGROUND NOTES:
+\"\"\"{background}\"\"\"
+
+KNOWN ANSWERS:
+{json.dumps(compact_answers, indent=2)}
+
+INFERRED PROFILE:
+{json.dumps(profile_payload, indent=2)}
+
+Return JSON only in this exact schema:
+[
+  {{
+    "step": 1,
+    "actor": "...",
+    "action": "...",
+    "rationale": "...",
+    "impact_on_equilibrium": "...",
+    "domain": "General|Career|Financial|Mental|Relationships"
+  }}
+]
+"""
+
+    try:
+        logging.info("Calling OpenAI for equilibrium-step inference.")
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            return []
+
+        steps: List[Dict[str, str]] = []
+        for item in data:
+            step_num = item.get("step")
+            actor = str(item.get("actor", "")).strip()
+            action = str(item.get("action", "")).strip()
+            rationale = str(item.get("rationale", "")).strip()
+            impact = str(item.get("impact_on_equilibrium", "")).strip()
+            domain = str(item.get("domain", "General")).strip() or "General"
+            if not isinstance(step_num, int):
+                continue
+            if not actor or not action or not rationale or not impact:
+                continue
+            steps.append({
+                "step": step_num,
+                "actor": actor,
+                "action": action,
+                "rationale": rationale,
+                "impact_on_equilibrium": impact,
+                "domain": domain,
+            })
+        steps.sort(key=lambda x: x["step"])
+        return steps[:8]
+    except Exception as e:
+        logging.error("Error during equilibrium-step inference: %s", e)
         return []
 
 
@@ -2848,6 +2939,7 @@ def build_profile(ws_q: Worksheet, ws_profile: Worksheet):
 
 def build_plan(ws_profile: Worksheet, ws_plan: Worksheet):
     logging.info("Building plan from profile.")
+    profile_rows: List[Dict[str, str]] = []
 
     for row in range(2, ws_profile.max_row + 1):
         trait = ws_profile.cell(row=row, column=1).value
@@ -2860,6 +2952,11 @@ def build_plan(ws_profile: Worksheet, ws_plan: Worksheet):
         trait_str = str(trait)
         label_str = str(label or "")
         notes_str = str(notes or "")
+        profile_rows.append({
+            "trait": trait_str,
+            "label": label_str,
+            "notes": notes_str,
+        })
 
         if trait_str in ["SocioeconomicGoals", "Financial", "RiskTolerance"]:
             domain = "Financial"
@@ -2883,6 +2980,17 @@ def build_plan(ws_profile: Worksheet, ws_plan: Worksheet):
             action,
             rationale,
             game_view,
+        ])
+
+    equilibrium_steps = infer_equilibrium_steps(BACKGROUND, get_answers_dict(ws_profile.parent[SHEET_QUESTIONS]), profile_rows)
+    for item in equilibrium_steps:
+        ws_plan.append([
+            item["domain"],
+            item["step"],
+            "near-term equilibrium path",
+            f"{item['actor']}: {item['action']}",
+            item["rationale"],
+            item["impact_on_equilibrium"],
         ])
 
     logging.info("Plan building complete: %d rows.", ws_plan.max_row - 1)
