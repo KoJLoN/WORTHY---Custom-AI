@@ -15,6 +15,8 @@ executed in an isolated namespace when that engine is selected.
 
 from pathlib import Path
 import openpyxl
+import re
+from collections import defaultdict
 
 # ------------------------------------------------------------
 # QUIET MODE — Silence HTTP request spam + OpenAI logs
@@ -76,6 +78,178 @@ def get_selector_and_background():
 
     background = "\n".join(_read_column_a_until_blank(ws, start_row=3)).strip()
     return selector, background
+
+
+def _normalize_text(val) -> str:
+    return "" if val is None else str(val).strip()
+
+
+def _read_prompt_from_sheet1(ws) -> str:
+    """
+    Uniform prompt reader for Sheet1:
+    - Legacy mode: if A1 is a single-letter module selector, read from A3 down.
+    - New mode: otherwise read from A1 down.
+    """
+    a1 = _normalize_text(ws["A1"].value)
+    if a1.upper() in {"W", "O", "R", "T", "H", "Y"} and len(a1) == 1:
+        return "\n".join(_read_column_a_until_blank(ws, start_row=3)).strip()
+    return "\n".join(_read_column_a_until_blank(ws, start_row=1)).strip()
+
+
+def _summarize_requirements(prompt: str) -> str:
+    parts = [p.strip() for p in re.split(r"[.\n]+", prompt) if p.strip()]
+    if not parts:
+        return "No clear requirements found."
+    return "; ".join(parts[:3])
+
+
+def _infer_field_and_skill(prompt: str):
+    p = prompt.lower()
+    field = "General"
+    skill = "Standard"
+
+    if any(k in p for k in ["cancer", "oncology", "clinical", "biomedical", "trial"]):
+        field = "Oncology Research"
+        skill = "PhD level"
+    elif any(k in p for k in ["slide", "deck", "pitch", "client", "consulting", "gala", "event"]):
+        field = "Events / Consulting"
+        skill = "Professional-Grade"
+    elif any(k in p for k in ["code", "engineer", "architecture", "system design", "algorithm"]):
+        field = "Engineering"
+        skill = "Advanced"
+
+    complexity_tokens = ["novel", "original", "breakthrough", "polymath", "hyper complex"]
+    if any(k in p for k in complexity_tokens):
+        skill = "Polymath / Novel"
+
+    return field, skill
+
+
+def _recommended_module_range(skill: str):
+    s = skill.lower()
+    if "polymath" in s or "novel" in s:
+        return "6-6"
+    if "phd" in s or "expert" in s:
+        return "2-10"
+    if "professional" in s or "advanced" in s:
+        return "1-4"
+    return "1-2"
+
+
+def _detect_explicit_modules(prompt: str):
+    p = prompt.lower()
+    picks = []
+    mapping = {
+        "W": [r"\bw\b", "writer", "writing", "story", "book", "essay"],
+        "O": [r"\bo\b", "operations", "control", "matrix", "decision"],
+        "R": [r"\br\b", "research", "investigate", "analyze sources"],
+        "T": [r"\bt\b", "technical", "engineering", "code", "build system"],
+        "H": [r"\bh\b", "life planner", "habit", "psychometric", "wellbeing"],
+        "Y": [r"\by\b", "persona", "style clone", "you-mode"],
+    }
+    for m, signals in mapping.items():
+        for sig in signals:
+            if sig.startswith(r"\b"):
+                if re.search(sig, p):
+                    picks.append(m)
+                    break
+            elif sig in p:
+                picks.append(m)
+                break
+    seen = set()
+    return [x for x in picks if not (x in seen or seen.add(x))]
+
+
+def _infer_best_modules(prompt: str):
+    explicit = _detect_explicit_modules(prompt)
+    if explicit:
+        return explicit[:2]
+
+    p = prompt.lower()
+    if any(k in p for k in ["research", "evidence", "sources", "literature review"]):
+        return ["R"]
+    if any(k in p for k in ["write", "draft", "article", "speech", "novel"]):
+        return ["W"]
+    if any(k in p for k in ["operations", "decision matrix", "control sheet"]):
+        return ["O"]
+    if any(k in p for k in ["technical", "code", "architecture", "data pipeline"]):
+        return ["T"]
+    if any(k in p for k in ["persona", "voice", "style mimic"]):
+        return ["Y"]
+    if any(k in p for k in ["life plan", "goal plan", "psychometric"]):
+        return ["H"]
+    return ["R"]
+
+
+def _ensure_executive_sheet(wb):
+    if "E1" in wb.sheetnames:
+        return wb["E1"]
+    ws = wb.create_sheet("E1", index=1)
+    ws.append([
+        "Requirement Summary",
+        "Selected Module(s)",
+        "Field",
+        "Skill Level",
+        "Recommended Modules",
+        "Tab Log",
+        "Tab Summary",
+        "Completion Check",
+        "Executive Reasoning / Notice",
+    ])
+    return ws
+
+
+def _append_exec_row(ws_e1, row_data: dict):
+    ws_e1.append([
+        row_data.get("requirements", ""),
+        row_data.get("modules", ""),
+        row_data.get("field", ""),
+        row_data.get("skill", ""),
+        row_data.get("recommended", ""),
+        row_data.get("tab_log", ""),
+        row_data.get("tab_summary", ""),
+        row_data.get("completion", ""),
+        row_data.get("reasoning", ""),
+    ])
+
+
+def _next_module_label(counter_map, module: str):
+    counter_map[module] += 1
+    return f"{module}{counter_map[module]}"
+
+
+def _create_module_tab(wb, module: str, counter_map):
+    label = _next_module_label(counter_map, module)
+    ws = wb.create_sheet(label)
+    ws["A1"] = f"{module} working tab"
+    tab_no = wb.sheetnames.index(label) + 1
+    return label, tab_no
+
+
+def _summarize_tab(ws):
+    snippets = []
+    for r in range(1, min(ws.max_row, 60) + 1):
+        for c in range(1, min(ws.max_column, 4) + 1):
+            v = ws.cell(row=r, column=c).value
+            if v is not None and str(v).strip():
+                snippets.append(str(v).strip())
+        if len(" ".join(snippets)) > 450:
+            break
+    text = " | ".join(snippets)[:500]
+    return text if text else "No output captured."
+
+
+def _completion_check(prompt: str, tab_summary: str):
+    p = prompt.lower()
+    s = tab_summary.lower()
+    answered = len(tab_summary) > 120
+    novel = any(k in s for k in ["novel", "new", "alternative", "creative", "insight"])
+    relevance = any(k in s for k in re.findall(r"[a-zA-Z]{5,}", p)[:12]) if p.strip() else False
+    is_complete = answered and novel and relevance
+    detail = (
+        f"answered={answered}, novel={novel}, relevant={relevance}"
+    )
+    return is_complete, detail
 
 
 # ---------------------------------------------------------------------------
@@ -3413,9 +3587,12 @@ def main():
     path = Path(WORTHY_XLSX_PATH)
     if path.exists():
         _ensure_sheet1_alias(path)
-    selector, background = get_selector_and_background()
-    if not selector:
-        raise SystemExit("First tab A1 is empty. Put one of W/O/R/T/H/Y there.")
+    wb = openpyxl.load_workbook(path)
+    sheet1 = wb["Sheet1"]
+    prompt = _read_prompt_from_sheet1(sheet1)
+    if not prompt.strip():
+        raise SystemExit("Sheet1 is empty. Add your prompt in column A.")
+    background = prompt
 
     engines = {
         "W": run_W,
@@ -3426,15 +3603,76 @@ def main():
         "Y": run_Y,
     }
 
-    runner = engines.get(selector)
-    if runner is None:
-        raise SystemExit(
-            f"Unknown engine selector {selector!r} in first tab A1. "
-            f"Expected one of W/O/R/T/H/Y."
-        )
+    # Legacy one-letter selector still supported.
+    selector = _normalize_text(sheet1["A1"].value).upper()
+    if selector in engines and len(selector) == 1:
+        engines[selector](background)
+        return
 
-    # Safe-bet mode: run exactly one engine, then exit.
-    runner(background)
+    e1 = _ensure_executive_sheet(wb)
+    field, skill = _infer_field_and_skill(prompt)
+    rec_range = _recommended_module_range(skill)
+    modules = _infer_best_modules(prompt)[:2]
+    module_counters = defaultdict(int)
+    wb.save(path)
+
+    req_summary = _summarize_requirements(prompt)
+    _append_exec_row(
+        e1,
+        {
+            "requirements": req_summary,
+            "modules": ",".join(modules),
+            "field": field,
+            "skill": skill,
+            "recommended": rec_range,
+            "reasoning": "Initial module selection based on Sheet1 prompt.",
+        },
+    )
+    wb.save(path)
+
+    min_r, max_r = map(int, rec_range.split("-"))
+    executed = 0
+
+    for m in modules:
+        wb = openpyxl.load_workbook(path)
+        e1 = wb["E1"]
+        label, tab_no = _create_module_tab(wb, m, module_counters)
+        wb.save(path)
+
+        tab_log = f"{label}-> tab {tab_no}"
+        engines[m](background)
+        executed += 1
+
+        wb = openpyxl.load_workbook(path)
+        output_ws = wb[label] if label in wb.sheetnames else wb["Sheet1"]
+        tab_summary = _summarize_tab(output_ws)
+        complete, check_detail = _completion_check(prompt, tab_summary)
+
+        reasoning = "Module execution completed."
+        if executed > max_r:
+            reasoning = (
+                "Notice! Exceeding recommended modules. Please wrap up quickly. "
+                "Concession: after next module, one completion condition will be dropped."
+            )
+
+        _append_exec_row(
+            wb["E1"],
+            {
+                "requirements": req_summary,
+                "modules": m,
+                "field": field,
+                "skill": skill,
+                "recommended": rec_range,
+                "tab_log": tab_log,
+                "tab_summary": tab_summary,
+                "completion": "Complete" if complete else f"Incomplete ({check_detail})",
+                "reasoning": reasoning,
+            },
+        )
+        wb.save(path)
+
+        if complete and executed >= min_r:
+            break
 
 
 if __name__ == "__main__":
